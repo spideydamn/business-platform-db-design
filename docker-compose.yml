@@ -1,0 +1,292 @@
+x-etcd-env: &etcd_env
+  ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+  ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+  ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+  ETCD_INITIAL_CLUSTER_STATE: new
+  ETCD_INITIAL_CLUSTER_TOKEN: pgcluster
+  ETCD_ENABLE_V2: "true"
+
+x-patroni-env: &patroni_env
+  PATRONI_SCOPE: pg-cluster
+  PATRONI_NAMESPACE: /service/
+  PATRONI_ETCD_HOSTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  PATRONI_SUPERUSER_USERNAME: ${POSTGRES_USER}
+  PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+  PATRONI_REPLICATION_USERNAME: replicator
+  PATRONI_REPLICATION_PASSWORD: replicator
+  PATRONI_LOG_LEVEL: INFO
+  
+services:
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.14
+    environment:
+      <<: *etcd_env
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+    command: etcd --name etcd1 --initial-advertise-peer-urls http://etcd1:2380
+    volumes:
+      - etcd1-data:/etcd-data
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.14
+    environment:
+      <<: *etcd_env
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+    command: etcd --name etcd2 --initial-advertise-peer-urls http://etcd2:2380
+    volumes:
+      - etcd2-data:/etcd-data
+
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.14
+    environment:
+      <<: *etcd_env
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+    command: etcd --name etcd3 --initial-advertise-peer-urls http://etcd3:2380
+    volumes:
+      - etcd3-data:/etcd-data
+
+  patroni1:
+    build:
+      context: ./patroni
+    hostname: patroni1
+    container_name: patroni1
+    environment:
+      <<: *patroni_env
+      PATRONI_NAME: patroni1
+      PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: patroni1:5432
+      PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+    volumes:
+      - patroni1-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8008/health"]
+
+  patroni2:
+    build:
+      context: ./patroni
+    hostname: patroni2
+    container_name: patroni2
+    environment:
+      <<: *patroni_env
+      PATRONI_NAME: patroni2
+      PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: patroni2:5432
+      PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+    volumes:
+      - patroni2-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8008/health"]
+
+  patroni3:
+    build:
+      context: ./patroni
+    hostname: patroni3
+    container_name: patroni3
+    environment:
+      <<: *patroni_env
+      PATRONI_NAME: patroni3
+      PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: patroni3:5432
+      PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+    volumes:
+      - patroni3-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8008/health"]
+
+  haproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.haproxy
+    container_name: haproxy
+    ports:
+      - "5432:5000"
+      - "5001:5001"
+      - "8008:8008"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    environment:
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -h haproxy -p 5000 -U $${PGUSER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    depends_on:
+      patroni1:
+        condition: service_healthy
+      patroni2:
+        condition: service_healthy
+      patroni3:
+        condition: service_healthy
+
+  init_db:
+    image: postgres
+    container_name: init_db
+    restart: "no"
+    environment:
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        psql -h haproxy -p 5001 -U "$$PGUSER" -d postgres -f /init.sql
+    volumes:
+      - ./init.sql:/init.sql
+    depends_on:
+      haproxy:
+        condition: service_healthy
+
+  flyway:
+    image: flyway/flyway
+    environment:
+      FLYWAY_URL: jdbc:postgresql://haproxy:5001/${POSTGRES_DB}
+      FLYWAY_USER: ${POSTGRES_USER}
+      FLYWAY_PASSWORD: ${POSTGRES_PASSWORD}
+      FLYWAY_LOCATIONS: filesystem:/flyway/sql
+      FLYWAY_TARGET: ${MIGRATION_VERSION:-latest}
+    command: migrate
+    volumes:
+      - ./flyway/sql:/flyway/sql
+    depends_on:
+      init_db:
+        condition: service_completed_successfully
+
+  seeder:
+    build:
+      context: ./seeder
+    environment:
+      DB_HOST: haproxy
+      DB_PORT: 5001
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_ENV: ${APP_ENV}
+      SEED_COUNT: ${SEED_COUNT}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS}
+    command: ["python", "seed.py"]
+    restart: on-failure
+    ports:
+      - "8010:8000"
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+    
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@haproxy:5001/${POSTGRES_DB}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+        init_db:
+            condition: service_completed_successfully
+        haproxy:
+            condition: service_healthy
+
+  role-init:
+    image: postgres
+    depends_on:
+      init_db:
+        condition: service_completed_successfully
+      haproxy:
+        condition: service_healthy
+    environment:
+      DB_HOST: haproxy
+      DB_PORT: 5001
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_USER: ${POSTGRES_USER}
+      DB_NAME: ${POSTGRES_DB}
+      ANALYST_NAMES: ${ANALYST_NAMES}
+    volumes:
+      - ./role-init/entrypoint.sh:/entrypoint.sh
+    entrypoint: ["bash", "/entrypoint.sh"]
+    
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - postgres-exporter
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  api:
+    build:
+      context: ./api
+    environment:
+      DB_HOST: haproxy
+      DB_PORT: 5001
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "8001:8000"
+    depends_on:
+        init_db:
+            condition: service_completed_successfully
+        haproxy:
+            condition: service_healthy
+
+  simulation:
+    build:
+      context: ./simulation
+    environment:
+      DB_HOST: haproxy
+      DB_PORT: 5001
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      SIMULATOR_RAW_INTERVAL_SEC: ${SIMULATOR_RAW_INTERVAL_SEC}
+    ports:
+      - "8002:8000"
+    depends_on:
+        init_db:
+            condition: service_completed_successfully
+        haproxy:
+            condition: service_healthy
+
+  postgres-backup:
+    build:
+      context: ./backup
+    container_name: backup
+    environment:
+      POSTGRES_HOST: haproxy
+      POSTGRES_PORT: 5001
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      BACKUP_RETENTION_COUNT: ${BACKUP_RETENTION_COUNT:-5}
+      BACKUP_INTERVAL_CRON: ${BACKUP_INTERVAL_CRON:-"0 * * * *"}
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      haproxy:
+        condition: service_healthy
+
+volumes:
+  etcd1-data:
+  etcd2-data:
+  etcd3-data:
+  patroni1-data:
+  patroni2-data:
+  patroni3-data:
+  postgres_data:
+  grafana-storage:

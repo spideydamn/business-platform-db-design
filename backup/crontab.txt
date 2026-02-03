@@ -1,0 +1,1 @@
+${BACKUP_INTERVAL_CRON} /backup.sh >> /var/log/cron.log 2>&1
